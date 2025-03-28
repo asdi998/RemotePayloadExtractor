@@ -9,6 +9,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import zstandard
+import argparse
 from collections import namedtuple
 import update_metadata_pb2 as um
 
@@ -294,9 +295,50 @@ def print_progress(current, total, prefix):
 
 # ========== 主函数优化 ==========
 def main():
-    if len(sys.argv) < 3:
-        print("用法: python RemotePayloadExtractor.py <ZIP_URL> <分区名称> [输出文件]")
+    
+    parser = argparse.ArgumentParser(description='远程分区提取工具')
+    parser.add_argument('zip_url', nargs='?', help='ZIP文件URL')
+    parser.add_argument('partition', nargs='?', help='要提取的分区名称')
+    parser.add_argument('output', nargs='?', help='输出文件名')
+    parser.add_argument('-l', '--list', action='store_true', help='仅列出可用分区')  # 新增列表参数
+    args = parser.parse_args()
+
+    if args.list:  # 列表模式逻辑
+        if not args.zip_url:
+            print("错误: 列表模式需要提供ZIP_URL")
+            return
+        
+        session = create_retry_session()
+        try:
+            print("正在获取文件大小...")
+            file_size = int(session.head(args.zip_url).headers['Content-Length'])
+            
+            print("解析ZIP结构...")
+            cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
+            
+            print("定位payload.bin...")
+            payload_offset, _ = find_file_in_zip(args.zip_url, cd_offset, cd_size, 'payload.bin', session)
+            
+            _, partitions, _ = parse_payload_header(args.zip_url, payload_offset, session)
+            
+            print("\n可用分区列表:")
+            print(f"{'分区名称':<20} | {'大小 (MB)':<10}")
+            print("-" * 35)
+            for p in partitions:
+                total_size = sum(op.data_length for op in p.operations) // 1024 // 1024
+                print(f"{p.partition_name:<20} | {total_size:<10}")
+            return
+            
+        except Exception as e:
+            print(f"\n错误发生: {type(e).__name__} - {str(e)}")
+            sys.exit(1)
+
+    # 原有下载逻辑
+    if not args.zip_url or not args.partition:
+        parser.print_help()
         return
+    
+    output_file = args.output if args.output else f"{args.partition}.img"
 
     session = create_retry_session()
     try:
