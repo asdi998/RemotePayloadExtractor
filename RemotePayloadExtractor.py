@@ -322,7 +322,7 @@ def main():
             _, partitions, _ = parse_payload_header(args.zip_url, payload_offset, session)
             
             print("\n可用分区列表:")
-            print(f"{'分区名称':<20} | {'大小 (MB)':<10}")
+            print(f"{'分区名称':<16} | {'大小 (MB)':<10}")
             print("-" * 35)
             for p in partitions:
                 total_size = sum(op.data_length for op in p.operations) // 1024 // 1024
