@@ -311,7 +311,7 @@ def main():
         session = create_retry_session()
         try:
             print("正在获取文件大小...")
-            file_size = int(session.head(args.zip_url).headers['Content-Length'])
+            file_size = int(session.head(args.zip_url, allow_redirects=True).headers['Content-Length'])
             
             print("解析ZIP结构...")
             cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
@@ -343,7 +343,7 @@ def main():
     session = create_retry_session()
     try:
         print("正在获取文件大小...")
-        file_size = int(session.head(args.zip_url).headers["Content-Length"])
+        file_size = int(session.head(args.zip_url, allow_redirects=True).headers["Content-Length"])
 
         print("解析ZIP结构...")
         cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
