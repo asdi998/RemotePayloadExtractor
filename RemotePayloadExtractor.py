@@ -342,36 +342,32 @@ def main():
 
     session = create_retry_session()
     try:
-        zip_url = sys.argv[1]
-        part_name = sys.argv[2]
-        output_file = sys.argv[3] if len(sys.argv) > 3 else f"{part_name}.img"
-
         print("正在获取文件大小...")
-        file_size = int(session.head(zip_url).headers["Content-Length"])
+        file_size = int(session.head(args.zip_url).headers["Content-Length"])
 
         print("解析ZIP结构...")
-        cd_offset, cd_size = find_zip_structure(zip_url, file_size, session)
+        cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
         print(f"中央目录位置: 偏移={cd_offset}, 大小={cd_size}")
 
         payload_offset, payload_size = find_file_in_zip(
-            zip_url, cd_offset, cd_size, "payload.bin", session
+            args.zip_url, cd_offset, cd_size, "payload.bin", session
         )
         print(f"payload.bin位置: 偏移={payload_offset}, 大小={payload_size}")
 
         partitions_start, partitions, block_size = parse_payload_header(
-            zip_url, payload_offset, session
+            args.zip_url, payload_offset, session
         )
 
-        target = next((p for p in partitions if p.partition_name == part_name), None)
+        target = next((p for p in partitions if p.partition_name == args.partition), None)
         if not target:
             available = ", ".join(p.partition_name for p in partitions)
-            raise ValueError(f"未找到分区 '{part_name}'，可用分区: {available}")
+            raise ValueError(f"未找到分区 '{args.partition}'，可用分区: {available}")
 
         total_size = sum(op.data_length for op in target.operations)
         print(f"开始下载 {target.partition_name} ({total_size//1024//1024}MB)")
 
         if download_partition(
-            zip_url,
+            args.zip_url,
             payload_offset + partitions_start,
             target,
             output_file,
