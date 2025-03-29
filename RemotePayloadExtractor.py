@@ -23,7 +23,17 @@ HEADER_FIXED_SIZE = 24  # payload.bin头部固定大小
 CHUNK_SIZE = 1024 * 1024  # 1MB分块下载
 MAX_RETRIES = 3  # 网络请求最大重试次数
 
-PartitionInfo = namedtuple("PartitionInfo", ["name", "size", "offset"])
+
+def convert_bytes(size):
+    """将字节数转换为人类易读的格式"""
+    units = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
+    for unit in units[:-1]:
+        if size < 1024:
+            break
+        size /= 1024
+    else:
+        unit = units[-1]
+    return f"{size:.2f} {unit}".replace(".00", "") if unit != "B" else f"{size} B"
 
 
 # ========== 网络请求配置 ==========
@@ -287,7 +297,7 @@ def print_progress(current, total, prefix):
     """统一的进度显示"""
     percent = current * 100 / total
     print(
-        f"\r{prefix}: {current//1024//1024}MB/{total//1024//1024}MB ({percent:.1f}%)",
+        f"\r{prefix}: {convert_bytes(current)}/{convert_bytes(total)} ({percent:.1f}%)",
         end="",
         flush=True,
     )
@@ -295,40 +305,50 @@ def print_progress(current, total, prefix):
 
 # ========== 主函数优化 ==========
 def main():
-    
-    parser = argparse.ArgumentParser(description='远程分区提取工具')
-    parser.add_argument('zip_url', nargs='?', help='ZIP文件URL')
-    parser.add_argument('partition', nargs='?', help='要提取的分区名称')
-    parser.add_argument('output', nargs='?', help='输出文件名')
-    parser.add_argument('-l', '--list', action='store_true', help='仅列出可用分区')  # 新增列表参数
+
+    parser = argparse.ArgumentParser(description="远程分区提取工具")
+    parser.add_argument("zip_url", nargs="?", help="ZIP文件URL")
+    parser.add_argument("partition", nargs="?", help="要提取的分区名称")
+    parser.add_argument("output", nargs="?", help="输出文件名")
+    parser.add_argument(
+        "-l", "--list", action="store_true", help="仅列出可用分区"
+    )  # 新增列表参数
     args = parser.parse_args()
 
     if args.list:  # 列表模式逻辑
         if not args.zip_url:
             print("错误: 列表模式需要提供ZIP_URL")
             return
-        
+
         session = create_retry_session()
         try:
             print("正在获取文件大小...")
-            file_size = int(session.head(args.zip_url, allow_redirects=True).headers['Content-Length'])
-            
+            file_size = int(
+                session.head(args.zip_url, allow_redirects=True).headers[
+                    "Content-Length"
+                ]
+            )
+
             print("解析ZIP结构...")
             cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
-            
+
             print("定位payload.bin...")
-            payload_offset, _ = find_file_in_zip(args.zip_url, cd_offset, cd_size, 'payload.bin', session)
-            
-            _, partitions, _ = parse_payload_header(args.zip_url, payload_offset, session)
-            
+            payload_offset, _ = find_file_in_zip(
+                args.zip_url, cd_offset, cd_size, "payload.bin", session
+            )
+
+            _, partitions, _ = parse_payload_header(
+                args.zip_url, payload_offset, session
+            )
+
             print("\n可用分区列表:")
-            print(f"{'分区名称':<16} | {'大小 (MB)':<10}")
+            print(f"{'分区名称':<16} | {'大小':<10}")
             print("-" * 35)
             for p in partitions:
-                total_size = sum(op.data_length for op in p.operations) // 1024 // 1024
-                print(f"{p.partition_name:<20} | {total_size:<10}")
+                total_size = sum(op.data_length for op in p.operations)
+                print(f"{p.partition_name:<20} | {convert_bytes(total_size):<10}")
             return
-            
+
         except Exception as e:
             print(f"\n错误发生: {type(e).__name__} - {str(e)}")
             sys.exit(1)
@@ -337,13 +357,15 @@ def main():
     if not args.zip_url or not args.partition:
         parser.print_help()
         return
-    
+
     output_file = args.output if args.output else f"{args.partition}.img"
 
     session = create_retry_session()
     try:
         print("正在获取文件大小...")
-        file_size = int(session.head(args.zip_url, allow_redirects=True).headers["Content-Length"])
+        file_size = int(
+            session.head(args.zip_url, allow_redirects=True).headers["Content-Length"]
+        )
 
         print("解析ZIP结构...")
         cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
@@ -358,13 +380,15 @@ def main():
             args.zip_url, payload_offset, session
         )
 
-        target = next((p for p in partitions if p.partition_name == args.partition), None)
+        target = next(
+            (p for p in partitions if p.partition_name == args.partition), None
+        )
         if not target:
             available = ", ".join(p.partition_name for p in partitions)
             raise ValueError(f"未找到分区 '{args.partition}'，可用分区: {available}")
 
         total_size = sum(op.data_length for op in target.operations)
-        print(f"开始下载 {target.partition_name} ({total_size//1024//1024}MB)")
+        print(f"开始下载 {target.partition_name} ({convert_bytes(total_size)})")
 
         if download_partition(
             args.zip_url,
