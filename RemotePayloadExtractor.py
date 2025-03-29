@@ -2,7 +2,6 @@
 import bz2
 import hashlib
 import lzma
-import os
 import sys
 import struct
 import requests
@@ -10,7 +9,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import zstandard
 import argparse
-from collections import namedtuple
 import update_metadata_pb2 as um
 
 # ========== 常量定义 ==========
@@ -26,14 +24,13 @@ MAX_RETRIES = 3  # 网络请求最大重试次数
 
 def convert_bytes(size):
     """将字节数转换为人类易读的格式"""
-    units = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
-    for unit in units[:-1]:
-        if size < 1024:
-            break
-        size /= 1024
-    else:
-        unit = units[-1]
-    return f"{size:.2f} {unit}".replace(".00", "") if unit != "B" else f"{size} B"
+    if size < 1024:
+        return f"{size} B"
+    units = ["KB", "MB", "GB", "TB", "PB"]
+    shift = (size.bit_length() - 1) // 10  # 计算需要右移的位数（log2(size)/10）
+    shift = min(shift, len(units))
+    size = f"{(size / (1 << (shift * 10))):.2f}".replace(".00", "")
+    return f"{size} {units[shift-1]}"
 
 
 # ========== 网络请求配置 ==========
@@ -231,44 +228,25 @@ def parse_payload_header(url, payload_offset, session):
 # ========== 下载逻辑优化 ==========
 def download_partition(url, base_offset, partition, output_file, session, block_size):
     """优化后的分区下载"""
-    temp_dir = f"{partition.partition_name}_temp"
-    os.makedirs(temp_dir, exist_ok=True)
-
     total_size = sum(op.data_length for op in partition.operations)
     downloaded = 0
 
-    try:
-        with open(output_file, "wb") as out_file:
-            for op in partition.operations:
-                op_path = os.path.join(temp_dir, f"{op.data_offset}.op")
+    with open(output_file, "wb") as out_file:
+        for op in partition.operations:
+            # 带重试的下载
+            start = base_offset + op.data_offset
+            data = get_remote_range(url, start, start + op.data_length - 1, session)
 
-                # 断点续传检查
-                if (
-                    os.path.exists(op_path)
-                    and os.path.getsize(op_path) == op.data_length
-                ):
-                    downloaded += op.data_length
-                    continue
+            # 实时处理数据
+            processed = process_operation(op, data, block_size)
+            out_file.seek(op.dst_extents[0].start_block * block_size)
+            out_file.write(processed)
 
-                # 带重试的下载
-                start = base_offset + op.data_offset
-                data = get_remote_range(url, start, start + op.data_length - 1, session)
+            downloaded += op.data_length
+            print_progress(downloaded, total_size, "下载进度")
 
-                # 实时处理数据
-                processed = process_operation(op, data, block_size)
-                out_file.seek(op.dst_extents[0].start_block * block_size)
-                out_file.write(processed)
-
-                downloaded += op.data_length
-                print_progress(downloaded, total_size, "下载进度")
-
-        print(f"\n分区 {partition.partition_name} 下载完成")
-        return True
-    finally:
-        # 清理临时文件
-        for f in os.listdir(temp_dir):
-            os.remove(os.path.join(temp_dir, f))
-        os.rmdir(temp_dir)
+    print(f"\n分区 {partition.partition_name} 下载完成")
+    return True
 
 
 def process_operation(op, data, block_size):
