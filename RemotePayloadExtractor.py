@@ -10,6 +10,10 @@ from urllib3.util.retry import Retry
 import zstandard
 import argparse
 import update_metadata_pb2 as um
+import threading
+import queue
+import time
+from collections import deque
 
 # ========== 常量定义 ==========
 ZIP_END_HEADER = b"\x50\x4b\x05\x06"
@@ -20,6 +24,18 @@ ZIP64_LOCATOR = b"\x50\x4b\x06\x07"
 HEADER_FIXED_SIZE = 24  # payload.bin头部固定大小
 CHUNK_SIZE = 1024 * 1024  # 1MB分块下载
 MAX_RETRIES = 3  # 网络请求最大重试次数
+DOWNLOAD_THREADS = 4  # 下载线程数
+SPEED_SAMPLES = 5  # 网速计算采样次数
+
+# ========== 全局状态 ==========
+file_lock = threading.Lock()
+download_stats = {
+    "total": 0,
+    "downloaded": 0,
+    "lock": threading.Lock(),
+    "history": deque(maxlen=SPEED_SAMPLES),
+}
+download_complete = threading.Event()  # 新增终止标志
 
 
 def convert_bytes(size):
@@ -27,7 +43,7 @@ def convert_bytes(size):
     if size < 1024:
         return f"{size} B"
     units = ["KB", "MB", "GB", "TB", "PB"]
-    shift = (size.bit_length() - 1) // 10  # 计算需要右移的位数（log2(size)/10）
+    shift = (size.bit_length() - 1) // 10
     shift = min(shift, len(units))
     size = f"{(size / (1 << (shift * 10))):.2f}".replace(".00", "")
     return f"{size} {units[shift-1]}"
@@ -40,7 +56,7 @@ def create_retry_session():
     retry = Retry(
         total=MAX_RETRIES, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504]
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=DOWNLOAD_THREADS)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -226,27 +242,121 @@ def parse_payload_header(url, payload_offset, session):
 
 
 # ========== 下载逻辑优化 ==========
-def download_partition(url, base_offset, partition, output_file, session, block_size):
-    """优化后的分区下载"""
-    total_size = sum(op.data_length for op in partition.operations)
-    downloaded = 0
+def download_worker(url, base_offset, op_queue, session, block_size, out_file):
+    """多线程下载工作线程"""
+    while True:
+        try:
+            op = op_queue.get_nowait()
+        except queue.Empty:
+            return
 
-    with open(output_file, "wb") as out_file:
-        for op in partition.operations:
-            # 带重试的下载
-            start = base_offset + op.data_offset
-            data = get_remote_range(url, start, start + op.data_length - 1, session)
+        start = base_offset + op.data_offset
+        data = get_remote_range(url, start, start + op.data_length - 1, session)
+        processed = process_operation(op, data, block_size)
 
-            # 实时处理数据
-            processed = process_operation(op, data, block_size)
+        with download_stats["lock"]:
+            download_stats["downloaded"] += op.data_length
+            download_stats["history"].append((time.time(), op.data_length))
+
+        # 加锁保证文件操作的原子性
+        with file_lock:
             out_file.seek(op.dst_extents[0].start_block * block_size)
             out_file.write(processed)
+        op_queue.task_done()
 
-            downloaded += op.data_length
-            print_progress(downloaded, total_size, "下载进度")
+
+def download_partition(url, base_offset, partition, output_file, session, block_size):
+    """多线程分区下载"""
+    total_size = sum(op.data_length for op in partition.operations)
+    with download_stats["lock"]:
+        download_stats["total"] = total_size
+        download_stats["downloaded"] = 0
+        download_stats["history"].clear()
+    download_complete.clear()  # 重置终止标志
+
+    op_queue = queue.Queue()
+    for op in partition.operations:
+        op_queue.put(op)
+
+    with open(output_file, "wb") as out_file:
+        threads = []
+        for _ in range(DOWNLOAD_THREADS):
+            t = threading.Thread(
+                target=download_worker,
+                args=(url, base_offset, op_queue, session, block_size, out_file),
+            )
+            t.start()
+            threads.append(t)
+
+        # 进度监控线程
+        progress_thread = threading.Thread(target=print_progress_loop)
+        progress_thread.start()
+
+        # 等待所有下载线程完成
+        for t in threads:
+            t.join()
+        op_queue.join()
+
+        # 通知进度线程终止
+        download_complete.set()
+        progress_thread.join()
 
     print(f"\n分区 {partition.partition_name} 下载完成")
     return True
+
+
+def calculate_speed():
+    """计算平均下载速度"""
+    history = download_stats["history"]
+    if len(history) < 2:
+        return 0
+    time_diff = history[-1][0] - history[0][0]
+    bytes_diff = sum(h[1] for h in history)
+    return int(bytes_diff / max(time_diff, 1e-6))  # 防止除以零
+
+
+def print_progress_loop():
+    """实时进度显示循环"""
+    start_time = time.time()
+    while not download_complete.is_set():  # 通过事件标志控制循环
+        with download_stats["lock"]:
+            current = download_stats["downloaded"]
+            total = download_stats["total"]
+            history = list(download_stats["history"])
+
+        # 计算网速和进度
+        if len(history) >= 2:
+            time_diff = history[-1][0] - history[0][0]
+            bytes_diff = sum(h[1] for h in history)
+            speed = int(bytes_diff / max(time_diff, 1e-6))
+        else:
+            speed = 0
+
+        elapsed = time.time() - start_time
+        print_progress(current, total, speed, elapsed)
+        time.sleep(0.5)
+
+    # 最后一次强制刷新进度
+    with download_stats["lock"]:
+        current = download_stats["downloaded"]
+        total = download_stats["total"]
+    elapsed = time.time() - start_time
+    print_progress(current, total, 0, elapsed)
+    print()  # 换行确保进度条不残留
+
+
+def print_progress(current, total, speed, elapsed):
+    """带网速的进度显示"""
+    percent = current * 100 / total if total else 0
+    speed_str = f"{convert_bytes(speed)}/s"
+    eta = (total - current) / speed if speed > 0 else 0
+    eta_str = f"{eta:.1f}s" if eta else "--"
+
+    progress = (
+        f"\r下载进度: {convert_bytes(current)}/{convert_bytes(total)} "
+        f"({percent:.1f}%) | 速度: {speed_str} | 用时: {elapsed:.1f}s | ETA: {eta_str}"
+    )
+    print(progress, end="", flush=True)
 
 
 def process_operation(op, data, block_size):
@@ -271,26 +381,13 @@ def process_operation(op, data, block_size):
     return decompressors[op.type](data)
 
 
-def print_progress(current, total, prefix):
-    """统一的进度显示"""
-    percent = current * 100 / total
-    print(
-        f"\r{prefix}: {convert_bytes(current)}/{convert_bytes(total)} ({percent:.1f}%)",
-        end="",
-        flush=True,
-    )
-
-
 # ========== 主函数优化 ==========
 def main():
-
     parser = argparse.ArgumentParser(description="远程分区提取工具")
     parser.add_argument("zip_url", nargs="?", help="ZIP文件URL")
     parser.add_argument("partition", nargs="?", help="要提取的分区名称")
     parser.add_argument("output", nargs="?", help="输出文件名")
-    parser.add_argument(
-        "-l", "--list", action="store_true", help="仅列出可用分区"
-    )  # 新增列表参数
+    parser.add_argument("-l", "--list", action="store_true", help="仅列出可用分区")
     args = parser.parse_args()
 
     if args.list:  # 列表模式逻辑
