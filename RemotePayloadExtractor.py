@@ -24,7 +24,7 @@ ZIP64_LOCATOR = b"\x50\x4b\x06\x07"
 HEADER_FIXED_SIZE = 24  # payload.bin头部固定大小
 CHUNK_SIZE = 1024 * 1024  # 1MB分块下载
 MAX_RETRIES = 3  # 网络请求最大重试次数
-DOWNLOAD_THREADS = 4  # 下载线程数
+DOWNLOAD_THREADS = 8  # 下载线程数
 SPEED_SAMPLES = 5  # 网速计算采样次数
 
 # ========== 全局状态 ==========
@@ -279,10 +279,10 @@ def download_worker(url, base_offset, op_queue, session, block_size, out_file):
 def download_partition(url, base_offset, partition, output_file, session, block_size):
     """支持中断的分区下载"""
     total_size = sum(op.data_length for op in partition.operations)
-    with download_stats['lock']:
-        download_stats['total'] = total_size
-        download_stats['downloaded'] = 0
-        download_stats['history'].clear()
+    with download_stats["lock"]:
+        download_stats["total"] = total_size
+        download_stats["downloaded"] = 0
+        download_stats["history"].clear()
     stop_event.clear()
 
     op_queue = queue.Queue()
@@ -296,7 +296,7 @@ def download_partition(url, base_offset, partition, output_file, session, block_
                 t = threading.Thread(
                     target=download_worker,
                     args=(url, base_offset, op_queue, session, block_size, out_file),
-                    daemon=True  # 设置为守护线程
+                    daemon=True,  # 设置为守护线程
                 )
                 t.start()
                 threads.append(t)
@@ -312,11 +312,11 @@ def download_partition(url, base_offset, partition, output_file, session, block_
             op_queue.join()
             download_complete.set()
             progress_thread.join(timeout=1)
-            
+
         return True
 
     except KeyboardInterrupt:
-        print("\n用户中断，正在清理...")
+        print("\n用户中断，正在退出...")
         stop_event.set()
         sys.exit(1)
     finally:
@@ -402,68 +402,41 @@ def process_operation(op, data, block_size):
 
 # ========== 主函数优化 ==========
 def main():
+    global DOWNLOAD_THREADS
     try:
         parser = argparse.ArgumentParser(description="远程分区提取工具")
         parser.add_argument("zip_url", nargs="?", help="ZIP文件URL")
         parser.add_argument("partition", nargs="?", help="要提取的分区名称")
         parser.add_argument("output", nargs="?", help="输出文件名")
         parser.add_argument("-l", "--list", action="store_true", help="仅列出可用分区")
+        parser.add_argument(
+            "-t", type=int, help=f"下载线程数，默认值{DOWNLOAD_THREADS}"
+        )
         args = parser.parse_args()
 
-        if args.list:  # 列表模式逻辑
-            if not args.zip_url:
-                print("错误: 列表模式需要提供ZIP_URL")
-                return
+        if args.t:
+            DOWNLOAD_THREADS = args.t
 
-            session = create_retry_session()
-            try:
-                print("正在获取文件大小...")
-                file_size = int(
-                    session.head(args.zip_url, allow_redirects=True).headers[
-                        "Content-Length"
-                    ]
-                )
-
-                print("解析ZIP结构...")
-                cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
-
-                print("定位payload.bin...")
-                payload_offset, _ = find_file_in_zip(
-                    args.zip_url, cd_offset, cd_size, "payload.bin", session
-                )
-
-                _, partitions, _ = parse_payload_header(
-                    args.zip_url, payload_offset, session
-                )
-
-                print("\n可用分区列表:")
-                print(f"{'分区名称':<16} | {'大小':<10}")
-                print("-" * 35)
-                for p in partitions:
-                    total_size = sum(op.data_length for op in p.operations)
-                    print(f"{p.partition_name:<20} | {convert_bytes(total_size):<10}")
-                return
-
-            except Exception as e:
-                print(f"\n错误发生: {type(e).__name__} - {str(e)}")
-                sys.exit(1)
-
-        # 原有下载逻辑
-        if not args.zip_url or not args.partition:
-            parser.print_help()
+        if not args.zip_url:
+            print("错误: 列表模式需要提供ZIP_URL")
             return
 
-        output_file = args.output if args.output else f"{args.partition}.img"
+        if not args.list and not args.partition:
+            parser.print_help()
+            return
 
         session = create_retry_session()
         try:
             print("正在获取文件大小...")
             file_size = int(
-                session.head(args.zip_url, allow_redirects=True).headers["Content-Length"]
+                session.head(args.zip_url, allow_redirects=True).headers[
+                    "Content-Length"
+                ]
             )
 
             print("解析ZIP结构...")
             cd_offset, cd_size = find_zip_structure(args.zip_url, file_size, session)
+
             print(f"中央目录位置: 偏移={cd_offset}, 大小={cd_size}")
 
             payload_offset, payload_size = find_file_in_zip(
@@ -475,12 +448,42 @@ def main():
                 args.zip_url, payload_offset, session
             )
 
+        except Exception as e:
+            print(f"\n错误发生: {type(e).__name__} - {str(e)}")
+            sys.exit(1)
+
+        if args.list:  # 列表模式逻辑
+            try:
+                print("\n可用分区列表:")
+                print(f"{'分区名称':<12} | {'镜像大小':<6} | {'下载大小':<6}")
+                print("-" * 42)
+                for p in partitions:
+                    total_size = sum(op.data_length for op in p.operations)
+                    print(
+                        f"{p.partition_name:<16} | {convert_bytes(p.new_partition_info.size):<10} | {convert_bytes(total_size):<10}"
+                    )
+                return
+
+            except Exception as e:
+                print(f"\n错误发生: {type(e).__name__} - {str(e)}")
+                sys.exit(1)
+
+        # 原有下载逻辑
+        if not args.partition:
+            parser.print_help()
+            return
+
+        output_file = args.output if args.output else f"{args.partition}.img"
+
+        try:
             target = next(
                 (p for p in partitions if p.partition_name == args.partition), None
             )
             if not target:
                 available = ", ".join(p.partition_name for p in partitions)
-                raise ValueError(f"未找到分区 '{args.partition}'，可用分区: {available}")
+                raise ValueError(
+                    f"未找到分区 '{args.partition}'，可用分区: {available}"
+                )
 
             total_size = sum(op.data_length for op in target.operations)
             print(f"开始下载 {target.partition_name} ({convert_bytes(total_size)})")
@@ -502,6 +505,7 @@ def main():
         print("\n操作被用户中断")
         stop_event.set()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
