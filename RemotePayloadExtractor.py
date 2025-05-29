@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 远程/本地负载提取工具 - 支持本地和远程ZIP文件
 
 import bz2
 import hashlib
@@ -55,6 +56,10 @@ class DownloadInterrupted(Exception):
     """下载被中断"""
     pass
 
+class SourceNotSupported(Exception):
+    """不支持的源类型"""
+    pass
+
 # ========== 全局状态 ==========
 file_lock = threading.Lock()
 download_stats = {
@@ -66,8 +71,8 @@ download_stats = {
 stop_event = threading.Event()
 download_complete = threading.Event()
 
-class DownloadManager:
-    """下载管理类"""
+class DataFetcher:
+    """数据获取器，支持远程URL和本地文件"""
     
     @staticmethod
     def create_session():
@@ -83,21 +88,57 @@ class DownloadManager:
         return session
     
     @staticmethod
-    def get_range(url, start, end=None, session=None):
+    def is_remote(source):
+        """检查是否是远程URL"""
+        return source.startswith("http://") or source.startswith("https://")
+    
+    @staticmethod
+    def get_range(source, start, end=None, session=None):
+        """从源获取指定范围的数据"""
         if stop_event.is_set():
-            raise DownloadInterrupted("下载已被中断")
+            raise DownloadInterrupted("操作已被中断")
             
-        session = session or DownloadManager.create_session()
-        range_header = f"bytes={start}-{end}" if end else f"bytes={start}-"
-        try:
-            # 缩短超时时间
-            response = session.get(url, headers={"Range": range_header}, timeout=5)
-            response.raise_for_status()
-            return response.content
-        except requests.exceptions.RequestException as e:
-            if stop_event.is_set():
-                raise DownloadInterrupted("下载已被中断")
-            raise
+        if DataFetcher.is_remote(source):
+            # 远程URL处理
+            session = session or DataFetcher.create_session()
+            range_header = f"bytes={start}-{end}" if end else f"bytes={start}-"
+            try:
+                response = session.get(source, headers={"Range": range_header}, timeout=5)
+                response.raise_for_status()
+                return response.content
+            except requests.exceptions.RequestException as e:
+                if stop_event.is_set():
+                    raise DownloadInterrupted("操作已被中断")
+                raise
+        else:
+            # 本地文件处理
+            try:
+                with open(source, 'rb') as f:
+                    f.seek(start)
+                    if end is None:
+                        return f.read()
+                    else:
+                        num_bytes = end - start + 1
+                        return f.read(num_bytes)
+            except Exception as e:
+                raise IOError(f"读取本地文件失败: {str(e)}")
+    
+    @staticmethod
+    def get_file_size(source):
+        """获取文件大小"""
+        if DataFetcher.is_remote(source):
+            # 远程URL处理
+            session = DataFetcher.create_session()
+            try:
+                return int(session.head(source, allow_redirects=True).headers["Content-Length"])
+            except:
+                raise ValueError("无法获取远程文件大小")
+        else:
+            # 本地文件处理
+            try:
+                return os.path.getsize(source)
+            except:
+                raise IOError("无法获取本地文件大小")
 
 class ZipUtils:
     """ZIP文件处理工具类"""
@@ -128,18 +169,18 @@ class ZipUtils:
         return values
     
     @staticmethod
-    def find_zip_structure(url, file_size, session):
+    def find_zip_structure(source, file_size, session=None):
         search_end = min(1024 * 1024, file_size)
-        end_chunk = DownloadManager.get_range(url, file_size-search_end, file_size-1, session)
+        end_chunk = DataFetcher.get_range(source, file_size-search_end, file_size-1, session)
         
         locator_pos = end_chunk.rfind(ZIP_HEADERS['LOCATOR64'])
         if locator_pos != -1:
             locator_offset = file_size - search_end + locator_pos
             end_offset = struct.unpack(
-                "<Q", DownloadManager.get_range(url, locator_offset+8, locator_offset+15, session)
+                "<Q", DataFetcher.get_range(source, locator_offset+8, locator_offset+15, session)
             )[0]
             
-            zip64_end = DownloadManager.get_range(url, end_offset, end_offset+1023, session)
+            zip64_end = DataFetcher.get_range(source, end_offset, end_offset+1023, session)
             cd_offset = struct.unpack("<Q", zip64_end[48:56])[0]
             cd_size = struct.unpack("<Q", zip64_end[40:48])[0]
             return cd_offset, cd_size
@@ -154,8 +195,8 @@ class ZipUtils:
             raise ValueError("无法识别ZIP文件结构")
     
     @staticmethod
-    def validate_local_header(url, local_offset, filename, session):
-        local_header = DownloadManager.get_range(url, local_offset, local_offset+29, session)
+    def validate_local_header(source, local_offset, filename, session=None):
+        local_header = DataFetcher.get_range(source, local_offset, local_offset+29, session)
         if local_header[:4] != ZIP_HEADERS['LOCAL']:
             raise ValueError(f"无效的本地头签名: {local_header[:4].hex()}")
 
@@ -163,8 +204,8 @@ class ZipUtils:
         extra_len_local = struct.unpack("<H", local_header[28:30])[0]
 
         full_header_size = 30 + name_len_local
-        local_header = DownloadManager.get_range(
-            url, local_offset, local_offset + full_header_size - 1, session
+        local_header = DataFetcher.get_range(
+            source, local_offset, local_offset + full_header_size - 1, session
         )
 
         name_local = local_header[30:30+name_len_local].decode("utf-8", "ignore")
@@ -174,13 +215,13 @@ class ZipUtils:
         return local_offset + full_header_size + extra_len_local
     
     @staticmethod
-    def find_file_in_zip(url, cd_offset, cd_size, filename, session):
-        cd_data = DownloadManager.get_range(url, cd_offset, cd_offset + cd_size - 1, session)
+    def find_file_in_zip(source, cd_offset, cd_size, filename, session=None):
+        cd_data = DataFetcher.get_range(source, cd_offset, cd_offset + cd_size - 1, session)
         pos = 0
 
         while pos <= len(cd_data) - 46:
             if stop_event.is_set():
-                raise DownloadInterrupted("下载已被中断")
+                raise DownloadInterrupted("操作已被中断")
                 
             if cd_data[pos:pos+4] != ZIP_HEADERS['CENTRAL']:
                 pos += 1
@@ -201,12 +242,12 @@ class ZipUtils:
                 print(f"定位到 {filename}，尝试验证本地头...")
                 try:
                     data_offset = ZipUtils.validate_local_header(
-                        url, actual_offset, filename, session
+                        source, actual_offset, filename, session
                     )
                     return data_offset, zip64_values.get("uncomp_size", header[8])
                 except ValueError as e:
                     print(f"本地头验证失败: {str(e)}")
-                    data_offset = ZipUtils.heuristic_search(url, actual_offset, filename, session)
+                    data_offset = ZipUtils.heuristic_search(source, actual_offset, filename, session)
                     return data_offset, zip64_values.get("uncomp_size", header[8])
 
             pos += 46 + name_len + extra_len + comment_len
@@ -214,9 +255,9 @@ class ZipUtils:
         raise FileNotFoundInZipError(f"ZIP中未找到 {filename}")
     
     @staticmethod
-    def heuristic_search(url, base_offset, filename, session):
+    def heuristic_search(source, base_offset, filename, session=None):
         search_start = max(0, base_offset - 1024)
-        search_data = DownloadManager.get_range(url, search_start, base_offset+1024, session)
+        search_data = DataFetcher.get_range(source, search_start, base_offset+1024, session)
         target_header = ZIP_HEADERS['LOCAL'] + filename.encode()
         found_pos = search_data.find(target_header)
         if found_pos != -1:
@@ -248,7 +289,7 @@ class ProgressUtils:
         eta_str = f"{eta:.1f}s" if eta else "--"
         
         progress = (
-            f"\r下载进度: {ProgressUtils.format_size(current)}/{ProgressUtils.format_size(total)} "
+            f"\r进度: {ProgressUtils.format_size(current)}/{ProgressUtils.format_size(total)} "
             f"({percent:.1f}%) | 速度: {speed_str} | 用时: {elapsed:.1f}s | ETA: {eta_str}"
         )
         print(progress, end="", flush=True)
@@ -274,7 +315,7 @@ class ProgressUtils:
             time.sleep(0.5)
 
         if stop_event.is_set():
-            print("\n下载已终止")
+            print("\n操作已终止")
         else:
             with download_stats["lock"]:
                 current = download_stats["downloaded"]
@@ -287,9 +328,9 @@ class PayloadExtractor:
     """payload.bin提取器"""
     
     @staticmethod
-    def parse_payload_header(url, payload_offset, session):
-        header = DownloadManager.get_range(
-            url, payload_offset, payload_offset + 512*1024 - 1, session
+    def parse_payload_header(source, payload_offset, session=None):
+        header = DataFetcher.get_range(
+            source, payload_offset, payload_offset + 512*1024 - 1, session
         )
 
         if len(header) < HEADER_FIXED_SIZE or header[:4] != b"CrAU":
@@ -337,7 +378,7 @@ class PayloadExtractor:
         return decompressor(data)
     
     @staticmethod
-    def download_worker(url, base_offset, op_queue, session, block_size, out_file):
+    def download_worker(source, base_offset, op_queue, session, block_size, out_file):
         while not stop_event.is_set():
             try:
                 op = op_queue.get(timeout=0.5)  # 缩短超时时间
@@ -350,7 +391,7 @@ class PayloadExtractor:
 
             try:
                 start = base_offset + op.data_offset
-                data = DownloadManager.get_range(url, start, start+op.data_length-1, session)
+                data = DataFetcher.get_range(source, start, start+op.data_length-1, session)
                 processed = PayloadExtractor.process_operation(op, data, block_size)
 
                 with download_stats["lock"]:
@@ -361,13 +402,13 @@ class PayloadExtractor:
                     out_file.seek(op.dst_extents[0].start_block * block_size)
                     out_file.write(processed)
             except Exception as e:
-                print(f"下载失败: {str(e)}")
+                print(f"操作失败: {str(e)}")
                 stop_event.set()
             finally:
                 op_queue.task_done()
     
     @staticmethod
-    def download_partition(url, base_offset, partition, output_file, session, block_size):
+    def download_partition(source, base_offset, partition, output_file, session, block_size):
         total_size = sum(op.data_length for op in partition.operations)
         with download_stats["lock"]:
             download_stats["total"] = total_size
@@ -386,7 +427,7 @@ class PayloadExtractor:
                 for _ in range(DOWNLOAD_THREADS):
                     t = threading.Thread(
                         target=PayloadExtractor.download_worker,
-                        args=(url, base_offset, op_queue, session, block_size, out_file),
+                        args=(source, base_offset, op_queue, session, block_size, out_file),
                         daemon=True
                     )
                     t.start()
@@ -412,7 +453,7 @@ class PayloadExtractor:
             sys.exit(1)
         finally:
             if stop_event.is_set():
-                print("\n下载已终止")
+                print("\n操作已终止")
 
 class FileExtractor:
     """ZIP文件提取器"""
@@ -422,7 +463,7 @@ class FileExtractor:
         pos = 0
         while pos <= len(cd_data) - 46:
             if stop_event.is_set():
-                raise DownloadInterrupted("下载已被中断")
+                raise DownloadInterrupted("操作已被中断")
                 
             if cd_data[pos:pos+4] != ZIP_HEADERS['CENTRAL']:
                 pos += 1
@@ -453,10 +494,9 @@ class FileExtractor:
         if stop_event.is_set():
             return None
             
-        url, session, file_offset, start, end, chunk_idx = args
+        source, session, file_offset, start, end, chunk_idx = args
         try:
-            # 使用更小的超时时间
-            data = DownloadManager.get_range(url, file_offset + start, file_offset + end - 1, session)
+            data = DataFetcher.get_range(source, file_offset + start, file_offset + end - 1, session)
             return chunk_idx, data
         except DownloadInterrupted:
             return None
@@ -465,37 +505,35 @@ class FileExtractor:
             return None
     
     @staticmethod
-    def extract_file_from_zip(url, file_size, cd_offset, cd_size, filename, output_path, session=None):
+    def extract_file_from_zip(source, file_size, cd_offset, cd_size, filename, output_path, session=None):
         """从ZIP中提取文件，使用预解析的中央目录信息"""
-        session = session or DownloadManager.create_session()
-        
         try:
-            print(f"正在从 {url} 提取 {filename}...")
-            file_offset, uncompressed_size = ZipUtils.find_file_in_zip(url, cd_offset, cd_size, filename, session)
+            print(f"正在从 {'远程URL' if DataFetcher.is_remote(source) else '本地文件'} 提取 {filename}...")
+            file_offset, uncompressed_size = ZipUtils.find_file_in_zip(source, cd_offset, cd_size, filename, session)
             
-            cd_data = DownloadManager.get_range(url, cd_offset, cd_offset + cd_size - 1, session)
+            cd_data = DataFetcher.get_range(source, cd_offset, cd_offset + cd_size - 1, session)
             compression_method, compressed_size = FileExtractor.get_file_compression_info(cd_data, filename)
             
             print(f"文件位置: 偏移={file_offset}, 大小={ProgressUtils.format_size(uncompressed_size)}")
             print(f"压缩方法: {COMPRESSION_METHODS.get(compression_method, ('未知', None))[0]}")
-            print("开始下载... (按Ctrl+C可中断)")
+            print("开始操作... (按Ctrl+C可中断)")
             
             start_time = time.time()
             
             if compression_method == 0:  # 未压缩
                 # 多线程下载文件
                 return FileExtractor.download_uncompressed_file(
-                    url, session, file_offset, uncompressed_size, output_path, start_time
+                    source, session, file_offset, uncompressed_size, output_path, start_time
                 )
             else:  # 需要解压缩
                 # 单线程下载压缩文件
                 return FileExtractor.download_compressed_file(
-                    url, session, file_offset, compressed_size, uncompressed_size, 
+                    source, session, file_offset, compressed_size, uncompressed_size, 
                     compression_method, output_path, start_time
                 )
         
         except DownloadInterrupted:
-            print("\n下载被中断")
+            print("\n操作被中断")
             try:
                 os.remove(output_path)
             except:
@@ -508,7 +546,7 @@ class FileExtractor:
             return False
     
     @staticmethod
-    def download_uncompressed_file(url, session, file_offset, file_size, output_path, start_time):
+    def download_uncompressed_file(source, session, file_offset, file_size, output_path, start_time):
         """多线程下载未压缩文件"""
         # 创建文件并设置大小
         try:
@@ -539,7 +577,7 @@ class FileExtractor:
                     if start >= file_size:
                         break
                         
-                    args = (url, session, file_offset, start, end, i)
+                    args = (source, session, file_offset, start, end, i)
                     futures.append(executor.submit(FileExtractor.download_chunk, args))
                 
                 # 处理下载结果
@@ -577,7 +615,7 @@ class FileExtractor:
             pass
         
         if stop_event.is_set():
-            print("\n下载被中断")
+            print("\n操作被中断")
             try:
                 os.remove(output_path)
             except:
@@ -591,7 +629,7 @@ class FileExtractor:
         return True
     
     @staticmethod
-    def download_compressed_file(url, session, file_offset, compressed_size, uncompressed_size, 
+    def download_compressed_file(source, session, file_offset, compressed_size, uncompressed_size, 
                                 compression_method, output_path, start_time):
         """下载并解压缩文件（带进度显示）"""
         # 获取解压器
@@ -611,7 +649,7 @@ class FileExtractor:
         try:
             while downloaded < compressed_size and not stop_event.is_set():
                 chunk_end = min(downloaded + chunk_size - 1, compressed_size - 1)
-                data = DownloadManager.get_range(url, file_offset + downloaded, file_offset + chunk_end, session)
+                data = DataFetcher.get_range(source, file_offset + downloaded, file_offset + chunk_end, session)
                 compressed_data += data
                 downloaded += len(data)
                 
@@ -626,7 +664,7 @@ class FileExtractor:
             pass
         
         if stop_event.is_set():
-            print("\n下载被中断")
+            print("\n操作被中断")
             return False
         
         # 最终进度更新
@@ -656,7 +694,7 @@ class FileExtractor:
 class ZipFileInfo:
     """ZIP文件信息缓存类"""
     def __init__(self):
-        self.url = None
+        self.source = None
         self.file_size = None
         self.cd_offset = None
         self.cd_size = None
@@ -667,29 +705,32 @@ class ZipFileInfo:
         self.block_size = None
         self.session = None
     
-    def load_basic_info(self, url, session):
+    def load_basic_info(self, source):
         """加载基本文件信息（大小和中央目录位置）"""
-        self.url = url
-        self.session = session or DownloadManager.create_session()
+        self.source = source
         
         # 获取文件大小
         if not self.file_size:
             print("正在获取文件大小...")
             try:
-                self.file_size = int(
-                    self.session.head(url, allow_redirects=True).headers["Content-Length"]
-                )
-            except:
-                pass
+                self.file_size = DataFetcher.get_file_size(source)
+                print(f"文件大小: {ProgressUtils.format_size(self.file_size)}")
+            except Exception as e:
+                print(f"错误: {str(e)}")
+                return False
         
         # 获取中央目录信息
         if not self.cd_offset or not self.cd_size:
             print("解析ZIP结构...")
             try:
-                self.cd_offset, self.cd_size = ZipUtils.find_zip_structure(url, self.file_size, self.session)
+                if DataFetcher.is_remote(source):
+                    self.session = DataFetcher.create_session()
+                self.cd_offset, self.cd_size = ZipUtils.find_zip_structure(source, self.file_size, self.session)
                 print(f"中央目录位置: 偏移={self.cd_offset}, 大小={self.cd_size}")
-            except:
-                pass
+            except Exception as e:
+                print(f"解析ZIP结构失败: {str(e)}")
+                return False
+        return True
     
     def load_payload_info(self):
         """加载payload.bin信息"""
@@ -697,26 +738,30 @@ class ZipFileInfo:
             print("定位payload.bin...")
             try:
                 self.payload_offset, self.payload_size = ZipUtils.find_file_in_zip(
-                    self.url, self.cd_offset, self.cd_size, "payload.bin", self.session
+                    self.source, self.cd_offset, self.cd_size, "payload.bin", self.session
                 )
                 print(f"payload.bin位置: 偏移={self.payload_offset}, 大小={self.payload_size}")
-            except:
-                pass
+            except Exception as e:
+                print(f"定位payload.bin失败: {str(e)}")
+                return False
         
         if not self.partitions_start or not self.partitions or not self.block_size:
             print("解析payload.bin头部...")
             try:
                 self.partitions_start, self.partitions, self.block_size = PayloadExtractor.parse_payload_header(
-                    self.url, self.payload_offset, self.session
+                    self.source, self.payload_offset, self.session
                 )
-            except:
-                pass
+            except Exception as e:
+                print(f"解析payload头部失败: {str(e)}")
+                return False
+        return True
     
     def list_partitions(self):
         """列出所有分区"""
         try:
-            self.load_payload_info()
-            
+            if not self.load_payload_info():
+                return False
+                
             if not self.partitions:
                 print("错误: 无法解析分区信息")
                 return False
@@ -737,7 +782,7 @@ class ZipFileInfo:
         """提取文件"""
         try:
             return FileExtractor.extract_file_from_zip(
-                self.url, self.file_size, self.cd_offset, self.cd_size, 
+                self.source, self.file_size, self.cd_offset, self.cd_size, 
                 filename, output_path, self.session
             )
         except FileNotFoundInZipError:
@@ -749,7 +794,8 @@ class ZipFileInfo:
     def extract_partition(self, partition_name, output_path):
         """提取分区"""
         try:
-            self.load_payload_info()
+            if not self.load_payload_info():
+                return False
             
             if not self.partitions:
                 print("错误: 无法解析分区信息")
@@ -763,10 +809,10 @@ class ZipFileInfo:
                 return False
             
             total_size = sum(op.data_length for op in target.operations)
-            print(f"开始下载 {target.partition_name} ({ProgressUtils.format_size(total_size)})")
+            print(f"开始提取 {target.partition_name} ({ProgressUtils.format_size(total_size)})")
             
             if PayloadExtractor.download_partition(
-                self.url,
+                self.source,
                 self.payload_offset + self.partitions_start,
                 target,
                 output_path,
@@ -781,7 +827,7 @@ class ZipFileInfo:
 
 def signal_handler(sig, frame):
     """处理Ctrl+C信号"""
-    print("\n接收到中断信号，正在终止下载...")
+    print("\n接收到中断信号，正在终止操作...")
     stop_event.set()
     # 不立即退出，让清理工作完成
     # 设置一个超时，防止永久等待
@@ -800,16 +846,18 @@ def main():
     
     try:
         parser = argparse.ArgumentParser(
-            description="远程分区提取工具",
+            description="远程/本地Payload提取工具",
             formatter_class=argparse.RawTextHelpFormatter,
             epilog="使用示例:\n"
                    "  1. 列出分区: python script.py https://example.com/update.zip\n"
+                   "     或本地文件: python script.py /path/to/update.zip\n"
                    "  2. 下载分区: python script.py https://example.com/update.zip boot\n"
+                   "     或本地文件: python script.py /path/to/update.zip boot\n"
                    "  3. 下载文件: python script.py https://example.com/update.zip payload.bin\n"
                    "  4. 指定输出: python script.py https://example.com/update.zip system -o system.img\n"
                    "  5. 多线程下载: python script.py https://example.com/update.zip vendor -t 16"
         )
-        parser.add_argument("url", help="ZIP文件URL")
+        parser.add_argument("source", help="ZIP文件URL或本地路径")
         parser.add_argument("name", nargs="?", default=None, 
                           help="要提取的分区名称或文件名（可选）")
         parser.add_argument("-o", "--output", help="输出文件名（可选）")
@@ -820,13 +868,24 @@ def main():
         args = parser.parse_args()
 
         DOWNLOAD_THREADS = args.threads
-        session = DownloadManager.create_session()
+        
+        # 检查本地文件是否存在（如果不是远程URL）
+        if not DataFetcher.is_remote(args.source):
+            if not os.path.isfile(args.source):
+                print(f"错误: 本地文件不存在 - {args.source}")
+                sys.exit(1)
+            print(f"处理本地文件: {args.source}")
+        else:
+            print(f"处理远程文件: {args.source}")
+        
         zip_info = ZipFileInfo()
         
         # 加载基本ZIP信息（只做一次）
-        zip_info.load_basic_info(args.url, session)
+        if not zip_info.load_basic_info(args.source):
+            print("错误: 无法加载ZIP基本信息")
+            sys.exit(1)
 
-        # 只提供URL时，列出分区
+        # 只提供源时，列出分区
         if not args.name:
             if not zip_info.list_partitions():
                 print("错误: 无法列出分区")
@@ -841,7 +900,7 @@ def main():
         if args.force_file or '.' in args.name or '/' in args.name:
             print("尝试作为文件提取...")
             if stop_event.is_set():
-                print("下载已被中断，退出程序")
+                print("操作已被中断，退出程序")
                 return
                 
             if zip_info.extract_file(args.name, output_file_file):
@@ -852,7 +911,7 @@ def main():
         
         # 检查是否已被中断
         if stop_event.is_set():
-            print("下载已被中断，退出程序")
+            print("操作已被中断，退出程序")
             return
             
         # 尝试提取分区
@@ -862,14 +921,14 @@ def main():
         
         # 检查是否已被中断
         if stop_event.is_set():
-            print("下载已被中断，退出程序")
+            print("操作已被中断，退出程序")
             return
             
         # 如果分区提取失败，尝试作为文件提取（作为后备）
         if not args.force_file:
             print("分区提取失败，尝试作为文件提取...")
             if stop_event.is_set():
-                print("下载已被中断，退出程序")
+                print("操作已被中断，退出程序")
                 return
                 
             if zip_info.extract_file(args.name, output_file_file):
