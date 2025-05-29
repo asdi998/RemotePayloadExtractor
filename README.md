@@ -1,6 +1,6 @@
 # Payload分区提取工具
 ```
-用法: RemotePayloadExtractor.py [-h] [-o OUTPUT] [-t THREADS] [-f] source [name]
+用法: ZipPayloadExtractor.py [-h] [-o OUTPUT] [-t THREADS] [-f] source [name]
 
 positional arguments:
   source                ZIP文件URL或本地路径
