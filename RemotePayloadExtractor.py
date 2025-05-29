@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 远程/本地负载提取工具 - 支持本地和远程ZIP文件
+# 远程/本地Payload中分区提取工具 - 支持本地和远程ZIP文件
 
 import bz2
 import hashlib
@@ -846,7 +846,7 @@ def main():
     
     try:
         parser = argparse.ArgumentParser(
-            description="远程/本地Payload提取工具",
+            description="分区提取工具",
             formatter_class=argparse.RawTextHelpFormatter,
             epilog="使用示例:\n"
                    "  1. 列出分区: python script.py https://example.com/update.zip\n"
