@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# 远程负载提取工具 - 修复中断流程和文件名问题
 
 import bz2
 import hashlib
